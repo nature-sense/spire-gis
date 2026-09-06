@@ -65,10 +65,21 @@ window.spireSetLayers = function(jsonStr){
     if(map.getSource(nm)) return;
     const color = PALETTE[idx % PALETTE.length];
     const s = paintFor(L.geometry_type,color);
-    map.addSource(nm,{type:'vector',tiles:['spire://tiles/'+encodeURIComponent(L.name)+'/{z}/{x}/{y}'],maxzoom:16});
-    map.addLayer({id:nm+'-layer',type:s.type,source:nm,'source-layer':'Feature',
+    // GeoJSON source: parsed on the main thread (no worker), so it renders in
+    // WKWebView regardless of worker availability.
+    map.addSource(nm,{type:'geojson',data:{type:'FeatureCollection',features:[]}});
+    map.addLayer({id:nm+'-layer',type:s.type,source:nm,
       layout:{visibility:(L.visible===false?'none':'visible')},paint:s.paint});
   });
+};
+window.spireSetLayerData = function(name,jsonStr){
+  try{
+    const src = map.getSource('spire-'+name); if(!src) return;
+    const fc = JSON.parse(jsonStr);
+    if(!fc || !fc.features) return;
+    src.setData(fc);
+    post({kind:'log',text:name+': '+fc.features.length+' features loaded'});
+  }catch(e){ post({kind:'log',text:'setData '+name+': '+e}); }
 };
 window.spireSetVisibility = function(name,visible){
   const id='spire-'+name+'-layer';

@@ -82,7 +82,7 @@ final class MapJSBridge: NSObject, WKScriptMessageHandler {
         }
     }
 
-    /// Push the current layer catalog to the map (adds sources/layers).
+    /// Push the current layer catalog to the map (adds GeoJSON sources/layers).
     func syncLayers(_ layers: [GisLayer]) {
         let items: [[String: Any]] = layers.map { l in
             ["name": l.name, "geometry_type": l.geometryType]
@@ -90,6 +90,20 @@ final class MapJSBridge: NSObject, WKScriptMessageHandler {
         guard let data = try? JSONSerialization.data(withJSONObject: items),
               let json = String(data: data, encoding: .utf8) else { return }
         evaluate("window.spireSetLayers(\(Self.jsString(json)))")
+    }
+
+    /// Load each layer's features from the graph (background) and render it.
+    func refreshLayerData(_ layers: [GisLayer]) {
+        for layer in layers {
+            Task.detached(priority: .userInitiated) { [core] in
+                let json = core.gisGetLayerGeoJson(layer: layer.name)
+                if let json {
+                    await MainActor.run { [weak self] in
+                        self?.evaluate("window.spireSetLayerData(\(Self.jsString(layer.name)),\(Self.jsString(json)))")
+                    }
+                }
+            }
+        }
     }
 
     func setVisibility(layerName: String, visible: Bool) {

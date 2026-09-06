@@ -227,6 +227,57 @@ pub async fn route_request(
             }))
         }
 
+        "gis/get-layer-geojson" => {
+            let layer = param(params, "layer")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if layer.is_empty() {
+                return Err("get-layer-geojson requires 'layer'".to_string());
+            }
+            let limit = param(params, "limit")
+                .and_then(|v| v.as_u64())
+                .map(|l| l.min(100_000) as u32)
+                .unwrap_or(10_000);
+
+            let (t, r) = oneshot::channel();
+            graph
+                .send(MemoryGraphMessage::QueryAttrNodes {
+                    node_type: Some(NODE_FEATURE.to_string()),
+                    subtype: Some(layer.clone()),
+                    name: None,
+                    limit: Some(limit),
+                    reply_to: t,
+                })
+                .await
+                .map_err(|e| format!("graph actor gone: {e}"))?;
+            let nodes = r
+                .await
+                .map_err(|e| format!("query reply lost: {e}"))?
+                .map_err(|e| format!("query layer '{layer}': {e}"))?;
+
+            let mut features = Vec::new();
+            for node in &nodes {
+                let Some(geometry) = node_geometry_geojson(node) else {
+                    continue;
+                };
+                let properties =
+                    serde_json::to_value(&node.properties).unwrap_or_else(|_| json!({}));
+                features.push(json!({
+                    "type": "Feature",
+                    "id": node.id(),
+                    "properties": properties,
+                    "geometry": geometry,
+                }));
+            }
+            Ok(json!({
+                "type": "FeatureCollection",
+                "features": features,
+                "total": features.len(),
+                "truncated": features.len() as u32 >= limit,
+            }))
+        }
+
         other => Err(format!("unknown method: {other}")),
     }
 }

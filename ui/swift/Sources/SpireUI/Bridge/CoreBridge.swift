@@ -221,6 +221,23 @@ final class CoreBridge {
         return String(data: resultData, encoding: .utf8)
     }
 
+    /// `gis/get-layer-geojson` → the whole layer as a compact GeoJSON
+    /// FeatureCollection string, or nil on error.
+    func gisGetLayerGeoJson(layer: String, limit: Int = 20_000) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "method": "gis/get-layer-geojson",
+            "params": ["layer": layer, "limit": limit],
+        ]), let request = String(data: data, encoding: .utf8),
+        let raw = send(request),
+        let reply = raw.data(using: .utf8),
+        let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+        let ok = json["ok"] as? Bool, ok,
+        let result = json["result"],
+        let resultData = try? JSONSerialization.data(withJSONObject: result)
+        else { return nil }
+        return String(data: resultData, encoding: .utf8)
+    }
+
     /// `gis/delete-layer` → remove a layer + its features.
     @discardableResult
     func gisDeleteLayer(id: String) -> Bool {

@@ -179,6 +179,7 @@ struct ContentView: View {
             visible[l.name] = true
         }
         map?.syncLayers(layers)
+        map?.refreshLayerData(layers)
         if let bounds = pendingFit {
             pendingFit = nil
             map?.fitBounds(bounds)
