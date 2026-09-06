@@ -1,0 +1,16 @@
+# Rust
+/target/
+
+# Swift
+ui/swift/.build/
+.build/
+
+# App bundles (keep build/assemble-app.sh, ignore assembled apps)
+build/*.app
+
+# Spire project/store data
+.spire/
+
+# macOS
+.DS_Store
+*.log

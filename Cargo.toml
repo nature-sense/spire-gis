@@ -1,0 +1,30 @@
+# spire-gis — Spire application monorepo (Rust core + SwiftUI app).
+#
+# Layout:
+#   crates/spire-gis/   Rust core (rlib + cdylib) on spire-actor + spire-core
+#   ui/swift/          host SwiftUI app embedding the core via the JSON FFI
+#   build/             app assembly (build/assemble-app.sh → <App>.app)
+
+[workspace]
+resolver = "2"
+members = ["crates/spire-gis"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+# Spire framework — sibling repos, resolved by path (must sit next to this repo).
+[workspace.dependencies]
+spire-actor = { path = "../spire-actor" }
+spire-core = { path = "../spire-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Do NOT strip in release builds (rust-lang/rust#157750): rustc's
+# `-C strip=debuginfo` post-link strip step misaligns the LINKEDIT string pool
+# for cdylibs that use chained fixups, and dyld then rejects the dylib at
+# dlopen time. `strip = "none"` keeps the FFI dylib loadable.
+[profile.release]
+strip = "none"

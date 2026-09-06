@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 NatureSense
+
+//! spire-gis domain models: Layer/Feature node builders + GeoJSON parsing.
+
+pub mod geojson;
+
+use std::collections::HashMap;
+
+use chrono::Utc;
+use serde_json::json;
+use spire_core::models::memory_graph::AttrNode;
+use spire_core::spatial::geo::Geometry;
+use uuid::Uuid;
+
+/// `node_type` for layer catalog records.
+pub const NODE_LAYER: &str = "Layer";
+/// `node_type` for feature records (each MVT layer = one `node_type`).
+pub const NODE_FEATURE: &str = "Feature";
+/// Custom edge label Layer → Feature.
+pub const EDGE_CONTAINS: &str = "CONTAINS";
+
+/// Reserved property keys kept out of the attribute map (handled as node
+/// fields or wire ids instead).
+pub const RESERVED_PROPS: [&str; 4] = ["id", "name", "source_id", "layer_id"];
+
+fn new_node(id: String, node_type: &str, name: &str) -> AttrNode {
+    AttrNode {
+        id,
+        node_type: node_type.to_string(),
+        subtype: None,
+        name: name.to_string(),
+        description: None,
+        properties: HashMap::new(),
+        embedding_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        version: 1,
+    }
+}
+
+/// A `Layer` catalog node. `style`/`schema` are stored as JSON scalars in
+/// `properties` (MapLibre style + inferred attribute schema).
+pub fn layer_node(
+    name: &str,
+    display_name: &str,
+    description: &str,
+    geometry_type: &str,
+    source: &str,
+    style: serde_json::Value,
+    schema: serde_json::Value,
+) -> AttrNode {
+    let mut n = new_node(Uuid::new_v4().to_string(), NODE_LAYER, name);
+    n.description = Some(description.to_string());
+    n.properties = HashMap::from([
+        ("display_name".to_string(), json!(display_name)),
+        ("geometry_type".to_string(), json!(geometry_type)),
+        ("source".to_string(), json!(source)),
+        ("style".to_string(), style),
+        ("schema".to_string(), schema),
+    ]);
+    n
+}
+
+/// A `Feature` node: geometry via `set_spatial_geometry` (derives the scalar
+/// bbox columns the spatial pre-filter scans) plus inline scalar attributes
+/// (so `tiles::encode_tile` tags them onto the MVT features).
+pub fn feature_node(
+    layer_id: &str,
+    source_id: &str,
+    name: &str,
+    geometry: &Geometry<f64>,
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> AttrNode {
+    let mut n = new_node(Uuid::new_v4().to_string(), NODE_FEATURE, name);
+    n.properties.insert("layer_id".to_string(), json!(layer_id));
+    n.properties
+        .insert("source_id".to_string(), json!(source_id));
+    for (k, v) in attributes {
+        if RESERVED_PROPS.contains(&k.as_str()) {
+            continue;
+        }
+        match v {
+            serde_json::Value::Null => {}
+            _ => {
+                n.properties.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    n.set_spatial_geometry(geometry);
+    n
+}
+
+/// Default MapLibre paint/layout for a geometry type (viewer merges this into
+/// its layer list).
+pub fn default_style(geometry_type: &str) -> serde_json::Value {
+    let layer = match geometry_type {
+        "Point" => json!({
+            "type": "circle",
+            "paint": { "circle-radius": 5, "circle-color": "#3388ff", "circle-opacity": 0.9 }
+        }),
+        "LineString" => json!({
+            "type": "line",
+            "paint": { "line-color": "#3388ff", "line-width": 2, "line-opacity": 0.9 }
+        }),
+        // Polygon + Mixed default to translucent fills.
+        _ => json!({
+            "type": "fill",
+            "paint": { "fill-color": "#3388ff", "fill-opacity": 0.35 }
+        }),
+    };
+    layer
+}
+
+/// Human label for a `geo::Geometry` (point/line/polygon classification).
+pub fn geometry_kind(g: &Geometry<f64>) -> &'static str {
+    match g {
+        Geometry::Point(_) | Geometry::MultiPoint(_) => "Point",
+        Geometry::Line(_) | Geometry::LineString(_) | Geometry::MultiLineString(_) => "LineString",
+        Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_) => "Polygon",
+        _ => "Mixed",
+    }
+}
