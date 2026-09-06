@@ -185,10 +185,10 @@ final class CoreBridge {
         return sendTyped(["method": "gis/import-geojson-file", "params": params], as: GisImportReport.self)
     }
 
-    /// `gis/import-datagov` → import the data.gov.sg National Map Polygon.
-    func gisImportDataGovSg(datasetId: String, name: String) -> GisImportReport? {
+    /// `gis/import-datagov` → import a data.gov.sg GeoJSON dataset as a layer.
+    func gisImportDataGovSg(datasetId: String, name: String, displayName: String) -> GisImportReport? {
         sendTyped(["method": "gis/import-datagov",
-                   "params": ["dataset_id": datasetId, "name": name]],
+                   "params": ["dataset_id": datasetId, "name": name, "display_name": displayName]],
                   as: GisImportReport.self)
     }
 

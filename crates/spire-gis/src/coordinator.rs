@@ -109,11 +109,15 @@ pub async fn route_request(
             let name = param(params, "name")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let display_name = param(params, "display_name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let (t, r) = oneshot::channel();
             import
                 .send(ImportMessage::ImportDataGovSg {
                     dataset_id,
                     name,
+                    display_name,
                     reply_to: t,
                 })
                 .await

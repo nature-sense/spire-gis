@@ -36,11 +36,23 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Button { importNationalMap() } label: {
-                if importing {
-                    ProgressView().controlSize(.small)
-                }
-                Label("Import National Map (data.gov.sg)", systemImage: "arrow.down.circle")
+            Button {
+                importDataGov(datasetId: "d_29f066d67df3eae91df8a42f443863c8",
+                              name: "national-map-polygon", displayName: "National Map Polygon")
+            } label: {
+                if importing { ProgressView().controlSize(.small) }
+                Label("Import National Map Polygon", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(importing)
+
+            Button {
+                importDataGov(datasetId: "d_10480c0b59e65663dfae1028ff4aa8bb",
+                              name: "national-map-line", displayName: "National Map Lines")
+            } label: {
+                if importing { ProgressView().controlSize(.small) }
+                Label("Import National Map Lines", systemImage: "arrow.down.circle")
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
@@ -186,25 +198,24 @@ struct ContentView: View {
         }
     }
 
-    /// Import the Singapore "National Map Polygon" from data.gov.sg on a
-    /// background thread (network + ~1400-feature store can take ~1 min), then
-    /// show + fit it on the map.
-    private func importNationalMap() {
+    /// Import a data.gov.sg GeoJSON dataset on a background thread (network +
+    /// store writes can take a while), then show + fit it on the map.
+    private func importDataGov(datasetId: String, name: String, displayName: String) {
         guard !importing else { return }
         importing = true
-        detail = "importing National Map from data.gov.sg…"
+        detail = "importing \(displayName) from data.gov.sg…"
         Task.detached(priority: .userInitiated) {
-            let report = self.core.gisImportDataGovSg(
-                datasetId: "d_29f066d67df3eae91df8a42f443863c8",
-                name: "national-map-polygon")
+            let report = self.core.gisImportDataGovSg(datasetId: datasetId,
+                                                      name: name,
+                                                      displayName: displayName)
             await MainActor.run {
                 self.importing = false
                 guard let report else {
-                    self.detail = "national map import failed (see Rust core log)"
+                    self.detail = "\(displayName) import failed (see Rust core log)"
                     return
                 }
                 self.pendingFit = report.bounds
-                self.detail = "national map: \(report.featureCount) \(report.geometryType) features imported"
+                self.detail = "\(displayName): \(report.featureCount) \(report.geometryType) features imported"
                 self.refreshLayers()
             }
         }
