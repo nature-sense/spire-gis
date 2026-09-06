@@ -185,6 +185,35 @@ final class CoreBridge {
         return sendTyped(["method": "gis/import-geojson-file", "params": params], as: GisImportReport.self)
     }
 
+    /// `gis/get-tile` → base64 MVT bytes for a layer at `z/x/y`.
+    func gisGetTile(layer: String, z: Int, x: Int, y: Int) -> String? {
+        struct GisTile: Codable { let tile: String; let bytes: Int }
+        let params: [String: Any] = ["layer": layer, "z": z, "x": x, "y": y]
+        let resp = sendTyped(["method": "gis/get-tile", "params": params], as: GisTile.self)
+        return resp?.tile
+    }
+
+    /// `gis/spatial-query` → the GeoJSON FeatureCollection (compact JSON string
+    /// ready to hand to the map), or nil on error.
+    func gisSpatialQuery(minLng: Double, minLat: Double, maxLng: Double, maxLat: Double,
+                         layer: String?, limit: Int = 2000) -> String? {
+        var params: [String: Any] = [
+            "min_lng": minLng, "min_lat": minLat,
+            "max_lng": maxLng, "max_lat": maxLat, "limit": limit,
+        ]
+        if let layer { params["layer"] = layer }
+        guard let data = try? JSONSerialization.data(withJSONObject: ["method": "gis/spatial-query", "params": params]),
+              let request = String(data: data, encoding: .utf8),
+              let raw = send(request),
+              let reply = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+              let ok = json["ok"] as? Bool, ok,
+              let result = json["result"],
+              let resultData = try? JSONSerialization.data(withJSONObject: result)
+        else { return nil }
+        return String(data: resultData, encoding: .utf8)
+    }
+
     /// `gis/delete-layer` → remove a layer + its features.
     @discardableResult
     func gisDeleteLayer(id: String) -> Bool {
