@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var visible: [String: Bool] = [:]
     @State private var detail = ""
     @State private var queryLayer: String?
+    @State private var importing = false
+    @State private var pendingFit: [Double]?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -34,11 +36,28 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Button { importNationalMap() } label: {
+                if importing {
+                    ProgressView().controlSize(.small)
+                }
+                Label("Import National Map (data.gov.sg)", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(importing)
+
             Button { importDemo() } label: {
                 Label("Import demo layer", systemImage: "plus.circle")
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
+
+            if let map {
+                Text(map.ready ? "map ready · served \(map.tilesServed) tiles"
+                              : "loading map…")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
 
             if layers.isEmpty {
                 Text("No layers yet — import the demo to see the map.")
@@ -160,6 +179,34 @@ struct ContentView: View {
             visible[l.name] = true
         }
         map?.syncLayers(layers)
+        if let bounds = pendingFit {
+            pendingFit = nil
+            map?.fitBounds(bounds)
+        }
+    }
+
+    /// Import the Singapore "National Map Polygon" from data.gov.sg on a
+    /// background thread (network + ~1400-feature store can take ~1 min), then
+    /// show + fit it on the map.
+    private func importNationalMap() {
+        guard !importing else { return }
+        importing = true
+        detail = "importing National Map from data.gov.sg…"
+        Task.detached(priority: .userInitiated) {
+            let report = self.core.gisImportDataGovSg(
+                datasetId: "d_29f066d67df3eae91df8a42f443863c8",
+                name: "national-map-polygon")
+            await MainActor.run {
+                self.importing = false
+                guard let report else {
+                    self.detail = "national map import failed (see Rust core log)"
+                    return
+                }
+                self.pendingFit = report.bounds
+                self.detail = "national map: \(report.featureCount) \(report.geometryType) features imported"
+                self.refreshLayers()
+            }
+        }
     }
 
     private func runViewportQuery(for layer: GisLayer) {

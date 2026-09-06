@@ -15,6 +15,8 @@ final class MapJSBridge: NSObject, WKScriptMessageHandler {
     weak var webView: WKWebView?
 
     private(set) var ready = false
+    /// Number of vector tiles served from the graph (proof the map is live).
+    private(set) var tilesServed = 0
     var onReady: (() -> Void)?
     var onStatus: ((String) -> Void)?
     /// Layer (by name) narrowed for viewport queries; nil = all layers.
@@ -52,6 +54,7 @@ final class MapJSBridge: NSObject, WKScriptMessageHandler {
               let z = body["z"] as? Int,
               let x = body["x"] as? Int,
               let y = body["y"] as? Int else { return }
+        tilesServed += 1
         let b64 = core.gisGetTile(layer: layer, z: z, x: x, y: y) ?? ""
         evaluate("window.spireResolveTile(\(Self.jsString(url)),\(Self.jsString(b64)))")
     }
@@ -95,6 +98,12 @@ final class MapJSBridge: NSObject, WKScriptMessageHandler {
 
     func clearResults() {
         evaluate("window.spireSetResults(null)")
+    }
+
+    /// Zoom the map to a `[minLng, minLat, maxLng, maxLat]` bounds.
+    func fitBounds(_ bounds: [Double]) {
+        guard bounds.count == 4 else { return }
+        evaluate("window.spireFitBounds && window.spireFitBounds([\(bounds[0]),\(bounds[1]),\(bounds[2]),\(bounds[3])])")
     }
 
     /// Ask the map for its current viewport; the reply triggers a spatial query.

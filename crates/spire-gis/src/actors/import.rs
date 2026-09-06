@@ -24,7 +24,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::models::geojson::{parse_geojson, DecodedFeature};
 use crate::models::{
-    default_style, feature_node, geometry_kind, layer_node, EDGE_CONTAINS, NODE_FEATURE, NODE_LAYER,
+    default_style, feature_node, geometry_kind, layer_node, sanitize_attributes, EDGE_CONTAINS,
+    NODE_FEATURE, NODE_LAYER,
 };
 
 /// A small wrapper over a graph transaction stream.
@@ -182,7 +183,52 @@ impl ImportActor {
             .map_err(|e| format!("graph actor gone: {e}"))?;
         let op_tx = r.await.map_err(|e| format!("txn open lost: {e}"))?;
         let txn = Txn { tx: op_tx };
-        txn.op(StreamOp::StoreNode(layer)).await?;
+        let result = self
+            .write_features(&txn, &layer, machine_name, &features)
+            .await;
+        let (feature_count, bounds) = match result {
+            Ok(x) => x,
+            Err(e) => {
+                // Roll back — dropping the stream sender would AUTO-COMMIT a
+                // half-written layer.
+                let _ = txn.op(StreamOp::Rollback).await;
+                return Err(e);
+            }
+        };
+
+        // Persist (debounced snapshots are not flushed before process exit).
+        let (t, r) = oneshot::channel();
+        self.graph
+            .send(MemoryGraphMessage::Sync { reply_to: t })
+            .await
+            .map_err(|e| format!("graph actor gone: {e}"))?;
+        r.await
+            .map_err(|e| format!("sync reply lost: {e}"))?
+            .map_err(|e| format!("sync failed: {e}"))?;
+
+        Ok(json!({
+            "layer_id": layer_id,
+            "name": machine_name,
+            "display_name": display_name,
+            "geometry_type": geometry_type,
+            "feature_count": feature_count,
+            "source": source,
+            "bounds": bounds,
+        }))
+    }
+
+    /// Store the layer + every feature inside `txn` and commit. Returns
+    /// `(feature_count, bounds)`. Callers roll the stream back on error
+    /// (dropping the sender would auto-commit instead).
+    async fn write_features(
+        &self,
+        txn: &Txn,
+        layer: &AttrNode,
+        machine_name: &str,
+        features: &[DecodedFeature],
+    ) -> Result<(u64, Option<[f64; 4]>), String> {
+        let layer_id = layer.id().to_string();
+        txn.op(StreamOp::StoreNode(layer.clone())).await?;
 
         let mut min_lng = f64::MAX;
         let mut min_lat = f64::MAX;
@@ -221,30 +267,12 @@ impl ImportActor {
         }
         txn.op(StreamOp::Commit).await?;
 
-        // Persist (debounced snapshots are not flushed before process exit).
-        let (t, r) = oneshot::channel();
-        self.graph
-            .send(MemoryGraphMessage::Sync { reply_to: t })
-            .await
-            .map_err(|e| format!("graph actor gone: {e}"))?;
-        r.await
-            .map_err(|e| format!("sync reply lost: {e}"))?
-            .map_err(|e| format!("sync failed: {e}"))?;
-
         let bounds = if min_lng <= max_lng && min_lat <= max_lat {
             Some([min_lng, min_lat, max_lng, max_lat])
         } else {
             None
         };
-        Ok(json!({
-            "layer_id": layer_id,
-            "name": machine_name,
-            "display_name": display_name,
-            "geometry_type": geometry_type,
-            "feature_count": feature_count,
-            "source": source,
-            "bounds": bounds,
-        }))
+        Ok((feature_count, bounds))
     }
 
     async fn import_file(
@@ -364,13 +392,15 @@ fn scalar_type(v: &Value) -> Option<&'static str> {
 }
 
 /// Union of attribute key → type across all features (string/number/boolean).
+/// Operates on the sanitized keys so the schema matches what is actually
+/// stored on the feature nodes.
 fn infer_schema(features: &[DecodedFeature]) -> Value {
     let mut schema: Map<String, Value> = Map::new();
     for f in features {
-        for (k, v) in &f.properties {
-            if let Some(t) = scalar_type(v) {
+        for (k, v) in sanitize_attributes(&f.properties) {
+            if let Some(t) = scalar_type(&v) {
                 schema
-                    .entry(k.clone())
+                    .entry(k)
                     .and_modify(|e| {
                         if e.as_str() != Some(t) {
                             *e = json!("mixed");

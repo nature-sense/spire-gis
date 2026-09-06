@@ -87,6 +87,10 @@ window.spireReportBounds = function(){
   const b = map.getBounds();
   post({kind:'bounds',minLng:b.getWest(),minLat:b.getSouth(),maxLng:b.getEast(),maxLat:b.getNorth()});
 };
+window.spireFitBounds = function(b){
+  if(!map || b.length!==4) return;
+  try{ map.fitBounds([[b[0],b[1]],[b[2],b[3]]],{padding:30,duration:600}); }catch(e){}
+};
 map.on('load',()=>post({kind:'ready'}));
 map.on('error',(e)=>post({kind:'log',text:'maplibre: '+(e && (e.error && e.error.message || e.message) || '')}));
 </script></body></html>

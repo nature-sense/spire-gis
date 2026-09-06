@@ -24,6 +24,82 @@ pub const EDGE_CONTAINS: &str = "CONTAINS";
 /// fields or wire ids instead).
 pub const RESERVED_PROPS: [&str; 4] = ["id", "name", "source_id", "layer_id"];
 
+/// Keys the graph store reserves for its own node fields — dropped from the
+/// attribute map so an import can never shadow them.
+const STORE_BASE_KEYS: [&str; 8] = [
+    "uuid",
+    "node_type",
+    "subtype",
+    "description",
+    "embedding_id",
+    "created_at",
+    "updated_at",
+    "version",
+];
+
+const MAX_ATTR_STRING_LEN: usize = 4096;
+
+/// Rewrite an arbitrary attribute key into a safe GQL property identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`); `None` when nothing usable remains. E.g.
+/// `"SHAPE.LEN"` → `"SHAPE_LEN"`.
+pub fn sanitize_key(key: &str) -> Option<String> {
+    let mut out = String::with_capacity(key.len());
+    for c in key.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    while out.starts_with('_') {
+        out.remove(0);
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty()
+        || out
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Make a string safe to embed in a single-quoted GQL literal (raw control
+/// characters can break the parser) and cap its length.
+pub fn sanitize_string_value(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+    cleaned.chars().take(MAX_ATTR_STRING_LEN).collect()
+}
+
+/// Keep only scalars with safe, non-reserved keys. Applied to raw GeoJSON
+/// attributes before they are stored or reflected in the layer schema.
+pub fn sanitize_attributes(
+    attrs: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (raw_key, value) in attrs {
+        let Some(key) = sanitize_key(raw_key) else {
+            continue;
+        };
+        if RESERVED_PROPS.contains(&key.as_str()) || STORE_BASE_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let value = match value {
+            serde_json::Value::String(s) => serde_json::Value::String(sanitize_string_value(s)),
+            serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.clone(),
+            _ => continue, // drop arrays/objects/null — not scalar GQL props
+        };
+        out.insert(key, value);
+    }
+    out
+}
+
 fn new_node(id: String, node_type: &str, name: &str) -> AttrNode {
     AttrNode {
         id,
@@ -76,16 +152,8 @@ pub fn feature_node(
     n.properties.insert("layer_id".to_string(), json!(layer_id));
     n.properties
         .insert("source_id".to_string(), json!(source_id));
-    for (k, v) in attributes {
-        if RESERVED_PROPS.contains(&k.as_str()) {
-            continue;
-        }
-        match v {
-            serde_json::Value::Null => {}
-            _ => {
-                n.properties.insert(k.clone(), v.clone());
-            }
-        }
+    for (k, v) in sanitize_attributes(attributes) {
+        n.properties.insert(k, v);
     }
     n.set_spatial_geometry(geometry);
     n

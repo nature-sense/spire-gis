@@ -185,6 +185,13 @@ final class CoreBridge {
         return sendTyped(["method": "gis/import-geojson-file", "params": params], as: GisImportReport.self)
     }
 
+    /// `gis/import-datagov` → import the data.gov.sg National Map Polygon.
+    func gisImportDataGovSg(datasetId: String, name: String) -> GisImportReport? {
+        sendTyped(["method": "gis/import-datagov",
+                   "params": ["dataset_id": datasetId, "name": name]],
+                  as: GisImportReport.self)
+    }
+
     /// `gis/get-tile` → base64 MVT bytes for a layer at `z/x/y`.
     func gisGetTile(layer: String, z: Int, x: Int, y: Int) -> String? {
         struct GisTile: Codable { let tile: String; let bytes: Int }
