@@ -7,6 +7,8 @@
 //! y = latitude). `GeometryCollection` is not decoded (tile/MVT encoding skips
 //! it too).
 
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
 use spire_core::spatial::geo::{
     Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
@@ -28,6 +30,17 @@ fn coord_from(v: &Value) -> Option<Coord<f64>> {
 fn ring_from(v: &Value) -> Option<LineString<f64>> {
     let coords: Vec<Coord<f64>> = v.as_array()?.iter().filter_map(coord_from).collect();
     if coords.len() < 3 {
+        return None;
+    }
+    Some(LineString(coords))
+}
+
+/// A GeoJSON line needs at least two vertices — data.gov.sg roads are often
+/// stored as straight 2-vertex segments, which `ring_from` (≥3, for polygon
+/// rings) would wrongly reject.
+fn line_from(v: &Value) -> Option<LineString<f64>> {
+    let coords: Vec<Coord<f64>> = v.as_array()?.iter().filter_map(coord_from).collect();
+    if coords.len() < 2 {
         return None;
     }
     Some(LineString(coords))
@@ -55,10 +68,10 @@ fn geometry_from(v: &Value) -> Option<Geometry<f64>> {
                 .collect();
             (!pts.is_empty()).then(|| Geometry::MultiPoint(MultiPoint(pts)))
         }
-        "LineString" => ring_from(coords).map(Geometry::LineString),
+        "LineString" => line_from(coords).map(Geometry::LineString),
         "MultiLineString" => {
             let lines: Vec<LineString<f64>> =
-                coords.as_array()?.iter().filter_map(ring_from).collect();
+                coords.as_array()?.iter().filter_map(line_from).collect();
             (!lines.is_empty()).then(|| Geometry::MultiLineString(MultiLineString(lines)))
         }
         "Polygon" => polygon_from(coords).map(Geometry::Polygon),
@@ -69,6 +82,12 @@ fn geometry_from(v: &Value) -> Option<Geometry<f64>> {
         }
         _ => None, // GeometryCollection etc. — not stored.
     }
+}
+
+/// Public helper: decode a GeoJSON geometry object (e.g. from a `gis/query`
+/// `contains`/`intersects` region) into a `geo` geometry.
+pub fn decode_geometry(v: &Value) -> Option<Geometry<f64>> {
+    geometry_from(v)
 }
 
 // === MORE ===
@@ -173,6 +192,50 @@ pub fn geometry_to_geojson(g: &Geometry<f64>) -> Value {
     }
 }
 
+/// Radial-distance decimation for *display* geometry: drops any vertex closer
+/// than `tol_deg` (degrees) to the last kept vertex, always keeping the first
+/// and last. Lines that would collapse below 2 vertices are returned unchanged.
+///
+/// Full-precision geometry stays in the store for spatial queries; this is only
+/// applied when serving a very large layer to the map, so the GeoJSON payload
+/// handed to the webview (and parsed on its main thread) stays small.
+pub fn decimate_geometry(g: &Geometry<f64>, tol_deg: f64) -> Geometry<f64> {
+    fn keep(pts: &[Coord<f64>], tol: f64) -> Vec<Coord<f64>> {
+        let mut out: Vec<Coord<f64>> = Vec::with_capacity(pts.len());
+        let n = pts.len();
+        for (i, p) in pts.iter().enumerate() {
+            let last = match out.last() {
+                Some(c) => *c,
+                None => {
+                    out.push(*p);
+                    continue;
+                }
+            };
+            let d = ((p.x - last.x).powi(2) + (p.y - last.y).powi(2)).sqrt();
+            if d >= tol || i == n - 1 {
+                out.push(*p);
+            }
+        }
+        out
+    }
+    fn dec_line(ls: &LineString<f64>, tol: f64) -> LineString<f64> {
+        let v = keep(&ls.0, tol);
+        if v.len() >= 2 {
+            LineString(v)
+        } else {
+            ls.clone()
+        }
+    }
+    match g {
+        Geometry::Line(_) | Geometry::Point(_) | Geometry::MultiPoint(_) => g.clone(),
+        Geometry::LineString(ls) => Geometry::LineString(dec_line(ls, tol_deg)),
+        Geometry::MultiLineString(mls) => Geometry::MultiLineString(
+            MultiLineString(mls.0.iter().map(|l| dec_line(l, tol_deg)).collect()),
+        ),
+        _ => g.clone(),
+    }
+}
+
 /// The geometry of a stored node (spatial_geometry, else its lat/lon point).
 pub fn node_geometry_geojson(node: &spire_core::models::memory_graph::AttrNode) -> Option<Value> {
     if let Some(g) = node.spatial_geometry() {
@@ -183,3 +246,66 @@ pub fn node_geometry_geojson(node: &spire_core::models::memory_graph::AttrNode) 
         None
     }
 }
+
+// ============================================================================
+// Streaming (memory-bounded) reader for large FeatureCollections
+// ============================================================================
+//
+// `parse_geojson` builds a whole-document `serde_json::Value` tree — fine for
+// small files, but a 350 MB layer expands to several GB of `Value` (that is
+// what OOM'd the national-map line import). Here the top level is parsed into
+// zero-copy `RawValue` slices (no deep tree) and each feature is decoded
+// independently, so peak memory stays proportional to the decoded features,
+// not to the whole JSON document.
+
+#[derive(Deserialize)]
+struct RawFeature<'a> {
+    #[serde(borrow, default)]
+    geometry: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    properties: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct RawCollection<'a> {
+    #[serde(borrow, default)]
+    features: Vec<RawFeature<'a>>,
+}
+
+/// Decode a FeatureCollection into owned features without materialising a
+/// whole-document `Value` tree. Features with `null`/unsupported geometry are
+/// skipped. `max_features` (optional) caps the decoded count.
+pub fn parse_geojson_stream(
+    text: &str,
+    max_features: Option<usize>,
+) -> Result<Vec<DecodedFeature>, String> {
+    let coll: RawCollection =
+        serde_json::from_str(text).map_err(|e| format!("invalid geojson json: {e}"))?;
+    let mut out: Vec<DecodedFeature> = Vec::with_capacity(coll.features.len().min(65_536));
+    for raw in coll.features {
+        if let Some(mx) = max_features {
+            if out.len() >= mx {
+                break;
+            }
+        }
+        let Some(geom_raw) = raw.geometry else { continue };
+        let geom_val: Value =
+            serde_json::from_str(geom_raw.get()).map_err(|e| format!("bad geometry: {e}"))?;
+        let Some(geometry) = geometry_from(&geom_val) else { continue };
+        let properties = match raw.properties {
+            Some(r) => serde_json::from_str::<Value>(r.get())
+                .map(|v| match v {
+                    Value::Object(m) => m,
+                    _ => Map::new(),
+                })
+                .unwrap_or_default(),
+            None => Map::new(),
+        };
+        out.push(DecodedFeature {
+            geometry,
+            properties,
+        });
+    }
+    Ok(out)
+}
+

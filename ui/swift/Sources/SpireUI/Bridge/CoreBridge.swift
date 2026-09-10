@@ -4,17 +4,18 @@ import Observation
 /// Reply envelope from the Rust core: `{"ok":bool, "result":…, "error":…}`.
 private struct GisEnvelope: Codable {
     let ok: Bool
-    let result: JSONValue?
+    let result: GisJSON?
     let error: String?
 }
 
-/// Minimal JSON passthrough so the envelope can hold an arbitrary result.
-private enum JSONValue: Codable {
+/// Minimal JSON passthrough so the envelope (and datasource configs / schema
+/// summaries) can hold arbitrary JSON values.
+enum GisJSON: Codable, Hashable {
     case bool(Bool)
     case number(Double)
     case string(String)
-    case array([JSONValue])
-    case object([String: JSONValue])
+    case array([GisJSON])
+    case object([String: GisJSON])
     case null
 
     init(from decoder: Decoder) throws {
@@ -23,8 +24,8 @@ private enum JSONValue: Codable {
         if let b = try? c.decode(Bool.self) { self = .bool(b); return }
         if let n = try? c.decode(Double.self) { self = .number(n); return }
         if let s = try? c.decode(String.self) { self = .string(s); return }
-        if let a = try? c.decode([JSONValue].self) { self = .array(a); return }
-        if let o = try? c.decode([String: JSONValue].self) { self = .object(o); return }
+        if let a = try? c.decode([GisJSON].self) { self = .array(a); return }
+        if let o = try? c.decode([String: GisJSON].self) { self = .object(o); return }
         throw DecodingError.dataCorrupted(.init(codingPath: c.codingPath, debugDescription: "unknown json"))
     }
 
@@ -66,6 +67,12 @@ struct GisImportReport: Codable {
     }
 }
 
+/// One classification (FOLDERPATH) within a layer.
+struct GisClassCount: Codable, Hashable {
+    let key: String
+    let count: Int
+}
+
 /// One entry from `gis/list-layers`.
 struct GisLayer: Codable, Identifiable, Hashable {
     let id: String
@@ -76,13 +83,80 @@ struct GisLayer: Codable, Identifiable, Hashable {
     let source: String
     let featureCount: Int
     let bounds: [Double]?
+    let classes: [GisClassCount]
+    /// Stacking order (higher = drawn on top).
+    let zOrder: Int
 
     enum CodingKeys: String, CodingKey {
-        case id, name, description, source, bounds
+        case id, name, description, source, bounds, classes
         case displayName = "display_name"
         case geometryType = "geometry_type"
         case featureCount = "feature_count"
+        case zOrder = "z_order"
     }
+}
+
+// MARK: - Data sources
+
+/// Refresh policy tag (`{"mode": "manual"}` today; interval refresh is a
+/// future scheduler feature).
+struct GisRefreshPolicy: Codable, Hashable {
+    let mode: String
+}
+
+/// Cached discovery summary carried on a definition (`discovered`).
+struct GisDiscovery: Codable, Hashable {
+    let featureCount: Int
+    let geometryTypes: [String]
+    let schema: GisJSON
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case featureCount = "feature_count"
+        case geometryTypes = "geometry_types"
+    }
+}
+
+/// Full discovery result from `gis/datasource/discover`.
+struct GisDatasetInfo: Codable, Hashable {
+    let name: String
+    let description: String
+    let geometryTypes: [String]
+    let featureCount: Int
+    let schema: GisJSON
+
+    enum CodingKeys: String, CodingKey {
+        case name, description, schema
+        case featureCount = "feature_count"
+        case geometryTypes = "geometry_types"
+    }
+}
+
+/// One data-source definition (`gis/datasource/list`).
+struct GisDataSource: Codable, Identifiable, Hashable {
+    let id: String
+    let kind: String
+    let label: String
+    let config: GisJSON?
+    let refresh: GisRefreshPolicy?
+    let enabled: Bool
+    let discovered: GisDiscovery?
+    let createdAt: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, label, config, refresh, enabled, discovered
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+/// Full attribute map for one stored feature (`gis/get-feature`).
+struct GisFeatureDetail: Codable, Hashable {
+    let id: String
+    let layer: String
+    let name: String
+    let attributes: [String: GisJSON]
 }
 
 /// Loads the Rust core (`libspire_gis.dylib`) and calls it over the JSON FFI.
@@ -200,6 +274,60 @@ final class CoreBridge {
         return resp?.tile
     }
 
+    /// `gis/query` → structured spatial-query DSL (JSON params). Returns the
+    /// raw result JSON string (FeatureCollection + total/by_class), or nil.
+    func gisQuery(params: [String: Any]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "method": "gis/query", "params": params,
+        ]), let request = String(data: data, encoding: .utf8),
+        let raw = send(request),
+        let reply = raw.data(using: .utf8),
+        let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+        let ok = json["ok"] as? Bool, ok,
+        let result = json["result"],
+        let resultData = try? JSONSerialization.data(withJSONObject: result)
+        else { return nil }
+        return String(data: resultData, encoding: .utf8)
+    }
+
+    /// `gis/nl-query` → LLM-translated natural-language query. Returns the raw
+    /// result JSON string (gis/query-shaped, plus `summary`/`source`), or nil
+    /// when the LLM path failed (caller should fall back).
+    func gisNlQuery(text: String, viewport: [String: Double]) -> String? {
+        let params: [String: Any] = ["text": text, "viewport": viewport]
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "method": "gis/nl-query", "params": params,
+        ]), let request = String(data: data, encoding: .utf8),
+        let raw = send(request),
+        let reply = raw.data(using: .utf8),
+        let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+        let ok = json["ok"] as? Bool, ok,
+        let result = json["result"],
+        let resultData = try? JSONSerialization.data(withJSONObject: result)
+        else { return nil }
+        return String(data: resultData, encoding: .utf8)
+    }
+
+    /// `gis/semantic-search` → SeleneDB vector search over embedded nodes.
+    /// `scope` is "Feature" (GeoJSON FeatureCollection) or "Layer"
+    /// (ranked layer list). Returns the raw result JSON string, or nil.
+    func gisSemanticSearch(text: String, scope: String = "Feature", limit: Int = 50,
+                           layer: String? = nil) -> String? {
+        var params: [String: Any] = ["text": text, "node_type": scope, "limit": limit]
+        if let layer { params["layer"] = layer }
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "method": "gis/semantic-search", "params": params,
+        ]), let request = String(data: data, encoding: .utf8),
+        let raw = send(request),
+        let reply = raw.data(using: .utf8),
+        let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+        let ok = json["ok"] as? Bool, ok,
+        let result = json["result"],
+        let resultData = try? JSONSerialization.data(withJSONObject: result)
+        else { return nil }
+        return String(data: resultData, encoding: .utf8)
+    }
+
     /// `gis/spatial-query` → the GeoJSON FeatureCollection (compact JSON string
     /// ready to hand to the map), or nil on error.
     func gisSpatialQuery(minLng: Double, minLat: Double, maxLng: Double, maxLat: Double,
@@ -222,11 +350,17 @@ final class CoreBridge {
     }
 
     /// `gis/get-layer-geojson` → the whole layer as a compact GeoJSON
-    /// FeatureCollection string, or nil on error.
-    func gisGetLayerGeoJson(layer: String, limit: Int = 20_000) -> String? {
+    /// FeatureCollection string, or nil on error. `simplify` (degrees) decimates
+    /// display geometry server-side — used for very large layers so the main
+    /// thread never has to parse a huge payload.
+    func gisGetLayerGeoJson(layer: String, limit: Int = 20_000,
+                            simplify: Double? = nil, dropProps: Bool = false) -> String? {
+        var params: [String: Any] = ["layer": layer, "limit": limit]
+        if let simplify { params["simplify"] = simplify }
+        if dropProps { params["drop_props"] = true }
         guard let data = try? JSONSerialization.data(withJSONObject: [
             "method": "gis/get-layer-geojson",
-            "params": ["layer": layer, "limit": limit],
+            "params": params,
         ]), let request = String(data: data, encoding: .utf8),
         let raw = send(request),
         let reply = raw.data(using: .utf8),
@@ -244,6 +378,101 @@ final class CoreBridge {
         struct Resp: Codable { let deleted: Bool }
         let resp = sendTyped(["method": "gis/delete-layer", "params": ["id": id]], as: Resp.self)
         return resp?.deleted == true
+    }
+
+    /// `gis/get-feature` → the full attribute map for one stored feature.
+    func gisGetFeature(id: String) -> GisFeatureDetail? {
+        sendTyped(["method": "gis/get-feature", "params": ["id": id]], as: GisFeatureDetail.self)
+    }
+
+    /// `gis/reorder-layer` → move a layer one step ("up"/"down") and get back
+    /// the freshly sorted catalog (bottom-to-top).
+    func gisReorderLayer(id: String, direction: String) -> [GisLayer] {
+        sendTyped(["method": "gis/reorder-layer",
+                   "params": ["id": id, "direction": direction]],
+                  as: [GisLayer].self) ?? []
+    }
+
+    // MARK: Data-source RPCs
+
+    /// `gis/datasource/kinds` → registered driver kinds, e.g. `["data-gov-sg"]`.
+    func gisDatasourceKinds() -> [String] {
+        decodeResult(#"{"method":"gis/datasource/kinds","params":{}}"#, as: [String].self) ?? []
+    }
+
+    /// `gis/datasource/list` → all persisted data-source definitions.
+    func gisDatasourceList() -> [GisDataSource] {
+        decodeResult(#"{"method":"gis/datasource/list","params":{}}"#, as: [GisDataSource].self) ?? []
+    }
+
+    /// `gis/datasource/get` → one definition by id.
+    func gisDatasourceGet(id: String) -> GisDataSource? {
+        sendTyped(["method": "gis/datasource/get", "params": ["id": id]], as: GisDataSource.self)
+    }
+
+    /// `gis/datasource/add` → create a data.gov.sg definition from a dataset id.
+    /// (The provider's whole config is `{"dataset_id": …}`.)
+    func gisDatasourceAdd(kind: String, label: String, datasetID: String) -> GisDataSource? {
+        sendTyped(["method": "gis/datasource/add",
+                   "params": ["kind": kind, "label": label,
+                              "config": ["dataset_id": datasetID]]],
+                  as: GisDataSource.self)
+    }
+
+    /// `gis/datasource/update` → patch label / dataset id / enabled.
+    func gisDatasourceUpdate(id: String, label: String? = nil,
+                             datasetID: String? = nil, enabled: Bool? = nil) -> GisDataSource? {
+        var params: [String: Any] = ["id": id]
+        if let label { params["label"] = label }
+        if let datasetID { params["config"] = ["dataset_id": datasetID] }
+        if let enabled { params["enabled"] = enabled }
+        return sendTyped(["method": "gis/datasource/update", "params": params], as: GisDataSource.self)
+    }
+
+    /// `gis/datasource/delete` → remove a definition.
+    @discardableResult
+    func gisDatasourceDelete(id: String) -> Bool {
+        struct Resp: Codable { let ok: Bool }
+        let resp = sendTyped(["method": "gis/datasource/delete", "params": ["id": id]], as: Resp.self)
+        return resp?.ok == true
+    }
+
+    /// `gis/datasource/discover` → metadata + attribute schema (no import).
+    func gisDatasourceDiscover(id: String) -> GisDatasetInfo? {
+        sendTyped(["method": "gis/datasource/discover", "params": ["id": id]], as: GisDatasetInfo.self)
+    }
+
+    /// `gis/datasource/fetch` → driver fetch + shared import pipeline.
+    func gisDatasourceFetch(id: String) -> GisImportReport? {
+        sendTyped(["method": "gis/datasource/fetch", "params": ["id": id]], as: GisImportReport.self)
+    }
+
+    // MARK: Config helpers
+
+    /// The data.gov.sg dataset id stored in a definition's config
+    /// (`{"dataset_id": "d_…"}`), or "".
+    static func datasetID(from config: GisJSON?) -> String {
+        guard case .object(let object)? = config,
+              case .string(let value)? = object["dataset_id"]
+        else { return "" }
+        return value
+    }
+
+    /// Render a scalar JSON value as display text (numbers drop a trailing
+    /// `.0`, booleans read naturally).
+    static func scalarText(_ value: GisJSON?) -> String {
+        switch value {
+        case .string(let s): return s
+        case .number(let n):
+            if n.isFinite, n == n.rounded(), abs(n) < 1e15 {
+                return String(Int64(n))
+            }
+            return String(n)
+        case .bool(let b): return b ? "true" : "false"
+        case .object(let o): return "{\(o.count) keys}"
+        case .array(let a): return "[\(a.count) items]"
+        case .null, .none: return ""
+        }
     }
 
     deinit {

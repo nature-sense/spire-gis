@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use serde_json::json;
+use serde_json::Value;
 use spire_core::models::memory_graph::AttrNode;
 use spire_core::spatial::geo::Geometry;
 use uuid::Uuid;
@@ -134,6 +135,9 @@ pub fn layer_node(
         ("source".to_string(), json!(source)),
         ("style".to_string(), style),
         ("schema".to_string(), schema),
+        // Stacking order (higher = drawn on top). Imports bump it so a new
+        // layer lands on top; the reorder RPC reassigns the whole sequence.
+        ("z_order".to_string(), json!(0)),
     ]);
     n
 }
@@ -189,3 +193,70 @@ pub fn geometry_kind(g: &Geometry<f64>) -> &'static str {
         _ => "Mixed",
     }
 }
+
+/// Keys whose values are plumbing, not descriptive text — excluded from the
+/// semantic-embedding text (and shown nowhere in the UI).
+fn is_plumbing_key(k: &str) -> bool {
+    matches!(k, "geometry" | "layer_id" | "source_id" | "embedding")
+        || matches!(k, "OBJECTID" | "objectid" | "FID" | "fid" | "ID" | "id")
+        || k.starts_with("min_")
+        || k.starts_with("max_")
+        || k.is_empty()
+}
+
+fn scalar_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Build a compact, searchable text for semantic embedding from a node.
+///
+/// Deterministic: the feature name + FOLDERPATH + layer name, then every
+/// descriptive scalar attribute (all string/number/bool values, skipping
+/// plumbing keys) in **sorted key order** — so place/district/area names are
+/// always embedded regardless of which columns a dataset uses.
+pub fn node_search_text(node: &AttrNode) -> String {
+    let mut parts: Vec<String> = vec![node.name().to_string()];
+    if let Some(c) = node.get("FOLDERPATH").and_then(|v| v.as_str()) {
+        parts.push(c.to_string());
+    }
+    if let Some(s) = node.subtype() {
+        parts.push(s.to_string());
+    }
+
+    let mut keys: Vec<&String> = node
+        .properties
+        .keys()
+        .filter(|k| !is_plumbing_key(k))
+        .collect();
+    keys.sort();
+
+    const MAX_TOTAL: usize = 1600;
+    const MAX_VALUE: usize = 200;
+    let mut budget: usize = 0;
+    for k in keys {
+        if budget >= MAX_TOTAL {
+            break;
+        }
+        let Some(s) = node.get(k).and_then(scalar_text) else {
+            continue;
+        };
+        let truncated: String = s.chars().take(MAX_VALUE).collect();
+        if budget + truncated.len() > MAX_TOTAL {
+            break;
+        }
+        budget += truncated.len();
+        parts.push(truncated);
+    }
+
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+

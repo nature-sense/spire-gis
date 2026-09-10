@@ -20,7 +20,7 @@ spire-actor = { path = "../spire-actor" }
 spire-core = { path = "../spire-core" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 
 # Do NOT strip in release builds (rust-lang/rust#157750): rustc's
 # `-C strip=debuginfo` post-link strip step misaligns the LINKEDIT string pool

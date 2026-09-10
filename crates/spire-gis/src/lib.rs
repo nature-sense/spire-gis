@@ -9,19 +9,24 @@
 pub mod actors;
 pub mod config;
 pub mod coordinator;
+pub mod datasources;
+pub mod hash_embedder;
 pub mod models;
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use spire_actor::Actor;
-use spire_core::actors::{MemoryGraphActor, MemoryGraphMessage, TileActor, TileMessage};
+use spire_core::actors::{
+    LlmActor, LlmMessage, MemoryGraphActor, MemoryGraphMessage, TileActor, TileMessage,
+};
 use tokio::sync::mpsc;
 
 use crate::actors::import::{ImportActor, ImportMessage};
 use crate::actors::layer::{LayerActor, LayerMessage};
+use crate::datasources::{DataSourceActor, DataSourceMessage, DriverRegistry};
 
 // ============================================================================
 // App state: one tokio runtime + the actor senders, built lazily on first FFI
@@ -33,7 +38,9 @@ struct AppState {
     graph: mpsc::Sender<MemoryGraphMessage>,
     layers: mpsc::Sender<LayerMessage>,
     import: mpsc::Sender<ImportMessage>,
+    datasources: mpsc::Sender<DataSourceMessage>,
     tile: mpsc::Sender<TileMessage>,
+    llm: mpsc::Sender<LlmMessage>,
 }
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -56,14 +63,14 @@ fn init() {
     }
     let data_dir = config::gis_data_dir();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let (graph, layers, import, tile) = runtime.block_on(async {
+    let (graph, layers, import, datasources, tile, llm) = runtime.block_on(async {
         let _ = std::fs::create_dir_all(&data_dir);
         let (graph_tx, rx) = mpsc::channel::<MemoryGraphMessage>(64);
         let _join = MemoryGraphActor::new().spawn(rx);
 
         let (t, r) = tokio::sync::oneshot::channel();
         graph_tx
-            .send(MemoryGraphMessage::Initialize {
+            .send(MemoryGraphMessage::InitializeInMemory {
                 data_dir: data_dir.clone(),
                 reply_to: t,
             })
@@ -73,16 +80,63 @@ fn init() {
             .expect("store init reply")
             .unwrap_or_else(|e| panic!("GIS store init failed at {}: {e}", data_dir.display()));
 
+        // Enable SeleneDB vector search. Try the neural embedder
+        // (sentence-transformers/all-MiniLM-L6-v2 via Candle, cached in the HF
+        // hub cache shared by all Spire apps); if it cannot load, degrade to
+        // the key-free deterministic HashEmbedder so semantic search still runs.
+        {
+            let embedder: Arc<dyn spire_core::models::embedding::Embedder> =
+                match spire_core::embedder::create_embedder() {
+                    Ok(candle) => {
+                        eprintln!(
+                            "gis embedder: neural model loaded (metal={})",
+                            candle.device_is_metal()
+                        );
+                        candle as Arc<dyn spire_core::models::embedding::Embedder>
+                    }
+                    Err(e) => {
+                        eprintln!("gis embedder: neural model unavailable ({e}); using HashEmbedder");
+                        Arc::new(hash_embedder::HashEmbedder::new())
+                    }
+                };
+            let (t, r) = tokio::sync::oneshot::channel();
+            graph_tx
+                .send(MemoryGraphMessage::InitializeEmbedder {
+                    model_path: None,
+                    embedder: Some(embedder),
+                    reply_to: t,
+                })
+                .await
+                .expect("send embedder init");
+            if let Err(e) = r.await.expect("embedder init reply") {
+                eprintln!("gis embedder init failed: {e}");
+            }
+        }
+
         let (layer_tx, lrx) = mpsc::channel::<LayerMessage>(64);
         let _ljoin = LayerActor::new(graph_tx.clone()).spawn(lrx);
 
         let (import_tx, irx) = mpsc::channel::<ImportMessage>(64);
         let _ijoin = ImportActor::new(graph_tx.clone()).spawn(irx);
 
+        // Data sources: configured connectors (definitions in the graph).
+        let (datasources_tx, drx) = mpsc::channel::<DataSourceMessage>(64);
+        let _djoin = DataSourceActor::new(
+            graph_tx.clone(),
+            DriverRegistry::builtin(),
+            import_tx.clone(),
+        )
+        .spawn(drx);
+
         let (tile_tx, trx) = mpsc::channel::<TileMessage>(64);
         let _tjoin = TileActor::new(graph_tx.clone()).spawn(trx);
 
-        (graph_tx, layer_tx, import_tx, tile_tx)
+        // LLM actor (DeepSeek / OpenAI-compatible HTTP client) used by
+        // `gis/nl-query` to translate natural language → the gis/query DSL.
+        let (llm_tx, llm_rx) = mpsc::channel::<LlmMessage>(8);
+        let _ljoin = LlmActor::new(spire_core::config::load_global_llm_config()).spawn(llm_rx);
+
+        (graph_tx, layer_tx, import_tx, datasources_tx, tile_tx, llm_tx)
     });
 
     let mut guard = lock_state();
@@ -91,7 +145,9 @@ fn init() {
         graph,
         layers,
         import,
+        datasources,
         tile,
+        llm,
     });
     INITIALIZED.store(true, Ordering::Release);
 }
@@ -124,10 +180,22 @@ fn process_request(request: &str) -> String {
         let graph = state.graph.clone();
         let layers = state.layers.clone();
         let import = state.import.clone();
+        let datasources = state.datasources.clone();
         let tile = state.tile.clone();
+        let llm = state.llm.clone();
         drop(guard);
         runtime.block_on(async move {
-            coordinator::route_request(&graph, &layers, &import, &tile, method, &params).await
+            coordinator::route_request(
+                &graph,
+                &layers,
+                &import,
+                &tile,
+                &llm,
+                &datasources,
+                method,
+                &params,
+            )
+            .await
         })
     };
     reply_json(result)

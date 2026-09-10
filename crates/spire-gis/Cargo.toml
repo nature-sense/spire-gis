@@ -8,6 +8,7 @@ description = "spire-gis — Spire-based application core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anyhow = "1"
 spire-actor = { workspace = true }
 spire-core = { workspace = true }
 tokio = { workspace = true }
